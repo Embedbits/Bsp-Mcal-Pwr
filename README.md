@@ -14,7 +14,9 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented** on the branch `Dev/STM32H5`. The unit tests run on the 12 STM32H5 device lines
+> (host, Unity + CMock + RegMem), the integration tests run on NUCLEO-H563ZI, NUCLEO-H503RB and NUCLEO-H533RE (the Stop and Standby modes are covered by the unit tests only). The interface
+> below is implemented for STM32H5 as described in the section "STM32H5 implementation" at the end of the families section.
 
 ---
 
@@ -86,7 +88,7 @@ master.
 
 | Family | Branch | Power controller | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `PWR`: voltage scales `VOS0` ... `VOS3`, LDO and (on STM32H563 / H573) SMPS, Sleep, Stop, Standby, wake-up pins `WKUP1` ... `WKUP8`, PVD, AVD, `VDDUSB` and `VDDIO2`, `VBAT` charging, TrustZone and privilege protection | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `PWR`: voltage scales `VOS0` ... `VOS3`, LDO and (on STM32H563 / H573) SMPS, Sleep, Stop, Standby, wake-up pins `WKUP1` ... `WKUP8`, PVD, AVD, `VDDUSB` and `VDDIO2`, `VBAT` charging, TrustZone and privilege protection | implemented, unit tests on 12 lines, integration tests run on NUCLEO-H563ZI, NUCLEO-H503RB and NUCLEO-H533RE |
 | STM32U5 | `Dev/STM32U5` | `PWR` with the Stop modes 0 ... 3, SMPS, wake-up pins, retention options of the SRAMs | planned |
 | STM32U3 | `Dev/STM32U3` | `PWR` | planned |
 | STM32G4, STM32L4 | `Dev/STM32G4`, `Dev/STM32L4` | `PWR` with the low-power modes Sleep, Low-power run / sleep, Stop 0 / 1 / 2, Standby, Shutdown, wake-up pins `WKUP1` ... `WKUP5`, PVD | planned |
@@ -96,6 +98,36 @@ master.
 A function without a meaning in a family stays in the interface, returns `PWR_REQUEST_ERROR` and suppresses the unused
 parameters (for example the Shutdown mode on a family without it, the SMPS on a device with the LDO only, a Stop
 sub-mode or a retention option the device does not have).
+
+### STM32H5 implementation
+
+- **Voltage scaling.** `PWR_VOLTAGE_SCALE_0` ... `PWR_VOLTAGE_SCALE_3` are `VOS0` ... `VOS3`. `Pwr_Set_VoltageScale` changes the scale one
+  scale at a time and waits (bounded) for `ACTVOS` and `ACTVOSRDY` (and `VOSRDY` when the performance is raised). The hardware resets the
+  scale to `VOS3` when the MCU leaves Stop mode, `Pwr_Set_StopEnter` restores the scale found at the entry before it calls the
+  `PostExitCallback`. `Pwr_Init` does not write the scale when it is already applied, `Pwr_Get_DefaultConfig` returns the current hardware
+  state. The Rcc module writes `VOS`, `DBP` and the `VDDUSB` supply bit through the LL driver until it is migrated: both modules can be used.
+- **Regulator.** The LDO or the SMPS (devices of the lines with `PWR_SCCR_SMPSEN`) is selected by the package, `Pwr_Set_RegulatorMode`
+  accepts them only when they match the package; `PWR_REGULATOR_BYPASS` (external VCORE) is written once after the power-on reset.
+- **Low-power modes.** Sleep, Stop (`PWR_STOP_0` / `PWR_STOP_1` / `PWR_STOP_2` = `SVOS3` / `SVOS4` / `SVOS5`) and Standby use the deep sleep
+  and the wait instructions of the Scb component. The STM32H5 has no Shutdown mode: `Pwr_Set_ShutdownEnter` returns `PWR_REQUEST_ERROR`.
+  `Pwr_Set_StandbyEnter` returns (with `PWR_REQUEST_ERROR`) only when the hardware refused the entry because a wake-up flag is pending.
+  The module does not link the Rcc module: the PWR has no clock enable bit.
+- **Wake-up.** `PWR_WAKEUP_PIN_1` ... `PWR_WAKEUP_PIN_8` are the fixed pins `WKUP1` ... `WKUP8` (STM32H503: `WKUP1` ... `WKUP5`, `WKUP3` has no pin on
+  STM32H523 / H533 / H543 / H553); the pin is set to analog mode without pull in the GPIO, the pull of the wake-up is in `PWR_WUCR`. The wake-up
+  source mask holds the wake-up flags of the pins and the Standby and Stop flags, the RTC and TAMP flags are read from the Rtc and Tamp modules.
+  `Pwr_Get_WakeUpSource`, `Pwr_Get_StandbyFlag`, `Pwr_Set_WakeUpFlagClear` and the backup access functions work without `Pwr_Init`.
+- **Retention.** The SRAM blocks of the device line (`PWR_SRAM_*`), the backup SRAM (backup regulator) and the I/O groups (`PWR_IO_GROUP_*`).
+- **Supervision.** The PVD and the AVD share the EXTI line 16 and one interrupt (both edges, the module reports the changes that match the
+  configured event to the `SupplyCallback`, from the interrupt or from `Pwr_Task`). The PVD configuration can be locked by the SBS module, the
+  read-back reports a write that did not take effect. `Pwr_Get_SupplyState` needs the monitor of the supply to be enabled.
+- **Backup domain.** `DBP` is cleared by the last `Pwr_Set_BackupAccessInactive` only when this module set it. The Rtc and Tamp modules take the
+  access through this module in their Init and release it in their Deinit.
+- **Deviations from the interface above.** The callback of the supervisors is `SupplyCallback` (it serves the PVD and the AVD). Added functions:
+  `Pwr_Get_RegulatorMode`, `Pwr_Set_WakeUpPinInactive`, `Pwr_Set_AvdActive`, `Pwr_Set_AvdInactive`, `Pwr_Set_BackupMonitor`,
+  `Pwr_Set_UsbSupplyInactive`. `Pwr_Set_Io2SupplyActive` returns `PWR_REQUEST_ERROR` (the STM32H5 has no validity bit for `VDDIO2`).
+- **Not implemented.** The analog switch booster (`BOOSTE` / `AVD_READY`), the UCPD Standby and dead battery bits (`PWR_UCPDR`), the OTG HS PHY
+  enable (`PWR_USBSCR.OTGHSEN`), the `CSLEEP` / `CSTOP` pins and the TrustZone / privilege configuration registers (`PWR_SECCFGR`,
+  `PWR_PRIVCFGR`): a write that the protection ignores is reported by the read-back.
 
 ---
 
